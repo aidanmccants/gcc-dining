@@ -1,0 +1,7 @@
+{
+  "name": "gcc-dining",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "vitest run", "deploy": "wrangler deploy" },
+  "devDependencies": { "vitest": "^5.0.2", "wrangler": "^4.143.1" }
+}
