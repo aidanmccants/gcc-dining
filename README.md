@@ -2,7 +2,9 @@
 
 Menus for the Grove City College dining halls, **MAP Cafe** and **Hicks Cafe**, served from a single Cloudflare Worker.
 
-The Worker pulls live data from Nutrislice on each request. It has no database. Dates default to today in US Eastern time.
+The Worker pulls live data from Nutrislice on each request. It has no database. Dates default to today in US Eastern time. 
+
+This api is used to power apps such as [Plate](https://plate.mccants.link).
 
 The same menus are available four ways:
 
