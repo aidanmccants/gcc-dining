@@ -1,14 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import worker from "../worker.js";
+import { fakeNutrislice, section, holiday, food } from "./fake-nutrislice.js";
 
-const section = (text) => ({ is_section_title: true, text });
-const food = (name) => ({ is_section_title: false, text: "", food: { name } });
-const week = (ymd, items) => ({ days: [{ date: ymd, menu_items: items }] });
-const ok = (body) => new Response(JSON.stringify(body), { status: 200 });
-
-function mockUpstream(fn) {
-  vi.stubGlobal("fetch", vi.fn(async (url) => fn(String(url))));
-}
 afterEach(() => vi.unstubAllGlobals());
 
 let nextId = 1;
@@ -47,10 +40,6 @@ describe("MCP handshake", () => {
     );
     expect(res.status).toBe(202);
   });
-  it("lists the get_menu tool", async () => {
-    const body = await (await rpc("tools/list", {})).json();
-    expect(body.result.tools.map((t) => t.name)).toEqual(["get_menu"]);
-  });
   it("is also reachable at /mcp on other hosts", async () => {
     const body = await (await rpc("ping", {}, "gcc-dining.example.workers.dev", "/mcp")).json();
     expect(body.result).toEqual({});
@@ -67,30 +56,47 @@ describe("MCP handshake", () => {
   });
 });
 
-describe("get_menu tool", () => {
-  it("returns one meal for one hall", async () => {
-    mockUpstream((url) =>
-      ok(week("2026-09-29", url.includes("map-cafe") ? [section("GRILL"), food("Burger")] : []))
-    );
-    const { result } = await (await call({ date: "2026-09-29", meal: "lunch", hall: "map" })).json();
-    expect(result.isError).toBeUndefined();
-    expect(result.structuredContent).toEqual({
-      date: "2026-09-29",
-      meals: { lunch: { map: { state: "menu", stations: [{ name: "GRILL", items: [{ name: "Burger" }] }] } } },
-    });
-    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+describe("MCP tools", () => {
+  const tool = (name, args) => rpc("tools/call", { name, arguments: args });
+
+  it("lists all three tools", async () => {
+    const body = await (await rpc("tools/list", {})).json();
+    expect(body.result.tools.map((t) => t.name)).toEqual(["get_menu", "get_locations", "nutrislice_raw"]);
   });
-  it("returns all meals and both halls by default", async () => {
-    mockUpstream(() => ok(week("2026-09-29", [])));
-    const { result } = await (await call({ date: "2026-09-29" })).json();
-    expect(Object.keys(result.structuredContent.meals)).toEqual(["breakfast", "lunch", "dinner"]);
-    expect(Object.keys(result.structuredContent.meals.dinner).sort()).toEqual(["hicks", "map"]);
+  it("get_menu matches /menu.json, including closures", async () => {
+    fakeNutrislice({
+      "map-cafe|lunch|2026-10-14": [section("GRILL"), food("Burger")],
+      "hicks-cafe|lunch|2026-10-14": [holiday("Closed for Fall Break")],
+    });
+    const { result } = await (await call({ date: "2026-10-14", meal: "lunch" })).json();
+    expect(result.isError).toBeUndefined();
+    const locs = result.structuredContent.days[0].locations;
+    expect(locs["map-cafe"].meals.lunch.stations[0].items[0].name).toBe("Burger");
+    expect(locs["hicks-cafe"].meals.lunch).toEqual({ state: "closed", notice: "Closed for Fall Break" });
+    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+    const rest = await (await worker.fetch(new Request("https://x/menu.json?date=2026-10-14&meal=lunch"), {})).json();
+    expect(rest).toEqual(result.structuredContent);
+  });
+  it("get_locations returns hours and status", async () => {
+    fakeNutrislice();
+    const { result } = await (await tool("get_locations", {})).json();
+    expect(result.structuredContent.locations[1]).toMatchObject({ slug: "hicks-cafe", status: "open" });
+  });
+  it("nutrislice_raw returns raw JSON text and rejects bad paths", async () => {
+    fakeNutrislice();
+    const ok = (await (await tool("nutrislice_raw", { path: "schools/" })).json()).result;
+    expect(JSON.parse(ok.content[0].text)[0].slug).toBe("map-cafe");
+    const bad = (await (await tool("nutrislice_raw", { path: "../x" })).json()).result;
+    expect(bad.isError).toBe(true);
   });
   it("reports bad arguments and upstream failures as tool errors", async () => {
+    fakeNutrislice();
     expect((await (await call({ date: "2026-02-30" })).json()).result.isError).toBe(true);
     expect((await (await call({ meal: "brunch" })).json()).result.isError).toBe(true);
-    mockUpstream(() => new Response("down", { status: 503 }));
-    expect((await (await call({ date: "2026-09-29" })).json()).result.isError).toBe(true);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("down", { status: 503 })));
+    const down = (await (await call({ date: "2026-09-29" })).json()).result;
+    expect(down.isError).toBe(true);
+    expect(down.content[0].text).toContain("Nutrislice");
   });
   it("rejects unknown tools", async () => {
     const body = await (await rpc("tools/call", { name: "nope", arguments: {} })).json();

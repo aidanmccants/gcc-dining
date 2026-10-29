@@ -11,10 +11,13 @@
  *   GET /lunch/map               -> MAP lunch
  *   GET /breakfast/hicks?date=2026-10-01
  *
- * JSON endpoint (read by the Plate app, includes allergen icons):
- *   GET /lunch/compare.json?date=2026-10-01
+ * JSON endpoints (read by the Plate app; all send CORS headers):
+ *   GET /lunch/compare.json?date=2026-10-01      MAP vs Hicks, allergen icons
+ *   GET /locations.json                          every location: hours, open/closed, meals
+ *   GET /menu.json?location=all&days=7&details=1 any location/meal/days, closures, nutrition
+ *   GET /raw/schools/                            cached passthrough to the Nutrislice API
  *
- * MCP server for AI agents (Streamable HTTP, no auth, tool: get_menu):
+ * MCP server for AI agents (Streamable HTTP, no auth; tools: get_menu, get_locations, nutrislice_raw):
  *   https://gccdining-mcp.mccants.link   (also POST /mcp on any host)
  *
  * Setup:
@@ -29,8 +32,9 @@
  * pasting worker.js alone into the dashboard editor will not work)
  */
 
-import { stationEntries, buildCompareJson, validMeal, validDate, MAX_BYTES } from "./menu-json.js";
-import { handleMcp } from "./mcp.js";
+import { stationEntries, holidayNotice, buildCompareJson, validMeal, validDate, MAX_BYTES } from "./menu-json.js";
+import { locationJson, dayJson } from "./normalize.js";
+import { handleMcp, CORS_HEADERS } from "./mcp.js";
 
 const API = "https://gcc.api.nutrislice.com/menu/api";
 const LOCATIONS = { map: "map-cafe", hicks: "hicks-cafe" };
@@ -41,23 +45,142 @@ const API_CHANGED_MSG =
   "Couldn't load the menu — Nutrislice's API may have changed. The worker needs an update.";
 const JSON_CACHE_SECONDS = 600;
 const MCP_HOST = "gccdining-mcp.mccants.link";
+const DEFAULT_LOCATIONS = ["map-cafe", "hicks-cafe"];
+const MAX_DAYS = 7;
+const MAX_UPSTREAM = 40; // stay under Cloudflare's per-request subrequest limit
+const MENU_MAX_BYTES = 1024 * 1024;
+const RAW_PATH = /^[A-Za-z0-9_\-./]*$/;
 
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const esc = (s) =>
   String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-// ttl > 0 lets Cloudflare cache the upstream response (used only by the JSON endpoint).
-async function dayItems(slug, meal, ymd, ttl = 0) {
-  const [y, m, d] = ymd.split("-");
-  const url = `${API}/weeks/school/${slug}/menu-type/${meal}/${y}/${m}/${d}/`;
+// ttl > 0 lets Cloudflare cache the upstream response (used by the JSON endpoints and MCP).
+function upstream(path, ttl = 0) {
   const init = { headers: { "User-Agent": "gcc-menus-worker/1.0" } };
   if (ttl > 0) init.cf = { cacheEverything: true, cacheTtl: ttl };
-  const res = await fetch(url, init);
+  return fetch(`${API}${path}`, init);
+}
+
+// The whole Sunday-Saturday week containing ymd.
+async function fetchWeek(slug, meal, ymd, ttl = 0) {
+  const [y, m, d] = ymd.split("-");
+  const res = await upstream(`/weeks/school/${slug}/menu-type/${meal}/${y}/${m}/${d}/`, ttl);
   if (!res.ok) throw new Error(`menu API HTTP ${res.status}`);
   const week = await res.json();
   if (!week || !Array.isArray(week.days)) throw new Error("menu API shape changed");
+  return week;
+}
+
+async function dayItems(slug, meal, ymd, ttl = 0) {
+  const week = await fetchWeek(slug, meal, ymd, ttl);
   const day = week.days.find((x) => x.date === ymd);
   return day ? day.menu_items || [] : null;
+}
+
+async function fetchSchools() {
+  const res = await upstream("/schools/", JSON_CACHE_SECONDS);
+  if (!res.ok) throw new Error(`schools API HTTP ${res.status}`);
+  const list = await res.json();
+  if (!Array.isArray(list)) throw new Error("schools API shape changed");
+  return list;
+}
+
+const addDays = (ymd, n) => {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+};
+const weekday = (ymd) =>
+  new Date(`${ymd}T00:00:00Z`).toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+// Sunday of ymd's week: one Nutrislice request covers all seven days.
+const weekStart = (ymd) => addDays(ymd, -new Date(`${ymd}T00:00:00Z`).getUTCDay());
+
+// GET /locations.json and the get_locations tool. Throws on upstream failure.
+async function locationsData() {
+  return { locations: (await fetchSchools()).map(locationJson) };
+}
+
+// GET /menu.json and the get_menu tool. Returns { data } or { error, status }.
+async function menuData(args = {}) {
+  const date = args.date || todayET();
+  const days = args.days === undefined || args.days === "" ? 1 : Number(args.days);
+  const meal = args.meal ? String(args.meal).toLowerCase() : undefined;
+  const details = args.details === true || ["1", "true", "yes"].includes(String(args.details).toLowerCase());
+  if (!validDate(date)) return { error: "invalid date, use YYYY-MM-DD", status: 400 };
+  if (!Number.isInteger(days) || days < 1 || days > MAX_DAYS)
+    return { error: `days must be 1-${MAX_DAYS}`, status: 400 };
+
+  let schools;
+  try {
+    schools = await fetchSchools();
+  } catch {
+    return { error: "upstream_unavailable", status: 502 };
+  }
+  const bySlug = new Map(schools.map((s) => [s.slug, s]));
+  const wanted = String(args.location || "").trim().toLowerCase();
+  const slugs = !wanted
+    ? DEFAULT_LOCATIONS
+    : wanted === "all"
+      ? schools.map((s) => s.slug)
+      : wanted.split(",").map((s) => LOCATIONS[s.trim()] || s.trim()).filter(Boolean);
+  const unknown = slugs.filter((s) => !bySlug.has(s));
+  if (unknown.length)
+    return { error: `unknown location ${unknown.join(", ")}; valid: ${[...bySlug.keys()].join(", ")}`, status: 400 };
+
+  // Every (location, meal) pair to show; meals come from each location's active menu types.
+  const pairs = [];
+  for (const slug of slugs) {
+    for (const t of bySlug.get(slug).active_menu_types || []) {
+      if (!meal || t.slug === meal) pairs.push({ slug, meal: t.slug });
+    }
+  }
+  if (meal && !pairs.length) return { error: `no selected location serves "${meal}"`, status: 400 };
+
+  const dates = Array.from({ length: days }, (_, i) => addDays(date, i));
+  const starts = [...new Set(dates.map(weekStart))];
+  if (pairs.length * starts.length > MAX_UPSTREAM)
+    return { error: "request too large; narrow location, meal, or days", status: 400 };
+
+  const weeks = new Map();
+  try {
+    await Promise.all(
+      pairs.flatMap((p) =>
+        starts.map(async (ws) => {
+          weeks.set(`${p.slug}|${p.meal}|${ws}`, await fetchWeek(p.slug, p.meal, ws, JSON_CACHE_SECONDS));
+        })
+      )
+    );
+  } catch {
+    return { error: "upstream_unavailable", status: 502 };
+  }
+
+  const out = {
+    start: dates[0],
+    end: dates[dates.length - 1],
+    days: dates.map((ymd) => {
+      const locations = {};
+      for (const p of pairs) {
+        const day = weeks.get(`${p.slug}|${p.meal}|${weekStart(ymd)}`).days.find((x) => x.date === ymd);
+        const loc = (locations[p.slug] ||= { name: bySlug.get(p.slug).name, meals: {} });
+        loc.meals[p.meal] = dayJson(day ? day.menu_items || [] : null, details);
+      }
+      return { date: ymd, weekday: weekday(ymd), locations };
+    }),
+  };
+  return { data: out };
+}
+
+// GET /raw/<path> and the nutrislice_raw tool: <path> is relative to the Nutrislice /menu/api base.
+async function rawFetch(path, search = "") {
+  const clean = String(path || "").replace(/^\/+/, "");
+  if (!RAW_PATH.test(clean) || clean.split("/").includes(".."))
+    return { status: 400, body: JSON.stringify({ error: "invalid path" }) };
+  try {
+    const res = await upstream(`/${clean}${search}`, JSON_CACHE_SECONDS);
+    return { status: res.status, body: await res.text() };
+  } catch {
+    return { status: 502, body: JSON.stringify({ error: "upstream_unavailable" }) };
+  }
 }
 
 function stationGroups(items) {
@@ -83,11 +206,11 @@ function todayET() {
   return `${y}-${m}-${d}`;
 }
 
-// Fetch one cafe's menu for one meal. Returns { groups } or { error }.
+// Fetch one cafe's menu for one meal. Returns { groups, notice } or { error }.
 async function cafeMenu(meal, loc, ymd) {
   try {
     const items = await dayItems(LOCATIONS[loc], meal, ymd);
-    return { groups: items === null ? [] : stationGroups(items) };
+    return { groups: items === null ? [] : stationGroups(items), notice: holidayNotice(items) };
   } catch {
     return { error: API_CHANGED_MSG };
   }
@@ -99,7 +222,10 @@ function renderCafe(meal, loc, ymd, menu, html) {
   const date = prettyDate(ymd);
   const head = html ? `<b>${esc(title)}</b>\n<i>${esc(date)}</i>` : `${title}\n${date}`;
   if (menu.error) return `${head}\n\n${html ? esc(menu.error) : menu.error}`;
-  if (!menu.groups.length) return `${head}\n\n(no menu posted)`;
+  if (!menu.groups.length) {
+    if (menu.notice) return `${head}\n\n${html ? esc(menu.notice) : menu.notice}`;
+    return `${head}\n\n(no menu posted)`;
+  }
   const blocks = menu.groups.map((g) => {
     const label = html ? `<b>${esc(g.station)}</b>` : g.station.toUpperCase();
     const lines = g.names.map((n) => (html ? `• ${esc(n)}` : `- ${n}`));
@@ -133,7 +259,7 @@ async function handleCommand(meal, target, ymd, html) {
 const jsonResponse = (body, status = 200, extra = {}) =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json", ...extra },
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extra },
   });
 
 // Both halls for one meal as JSON (shared by compare.json and the MCP server). Throws on upstream failure.
@@ -150,7 +276,7 @@ async function compareJson(meal, ymd) {
   try {
     const body = JSON.stringify(await mealJson(meal, ymd));
     if (new TextEncoder().encode(body).length > MAX_BYTES) throw new Error("response too large");
-    return new Response(body, { headers: { "Content-Type": "application/json" } });
+    return new Response(body, { headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
   } catch {
     return jsonResponse({ error: "upstream_unavailable" }, 502);
   }
@@ -199,7 +325,36 @@ export default {
 
     // --- MCP server: POST /mcp on any host, or / on the dedicated MCP domain ---
     if (path === "/mcp" || (url.hostname === MCP_HOST && path === "/")) {
-      return handleMcp(req, { loadMeal: mealJson, today: todayET });
+      return handleMcp(req, { menuData, locationsData, rawFetch });
+    }
+
+    // --- Browser preflight for the JSON endpoints ---
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+
+    // --- Raw Nutrislice passthrough: /raw/schools/ -> {API}/schools/ (keeps trailing slash) ---
+    if (req.method === "GET" && url.pathname.startsWith("/raw/")) {
+      const { status, body } = await rawFetch(url.pathname.slice("/raw/".length), url.search);
+      return new Response(body, { status, headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
+    }
+
+    // --- /locations.json: hours, open/closed, meals for every location ---
+    if (req.method === "GET" && path === "/locations.json") {
+      try {
+        return jsonResponse(await locationsData());
+      } catch {
+        return jsonResponse({ error: "upstream_unavailable" }, 502);
+      }
+    }
+
+    // --- /menu.json: any locations, meals, and days, with closures and optional nutrition ---
+    if (req.method === "GET" && path === "/menu.json") {
+      const q = Object.fromEntries(url.searchParams);
+      const { data, error, status } = await menuData(q);
+      if (error) return jsonResponse({ error }, status);
+      const body = JSON.stringify(data);
+      if (new TextEncoder().encode(body).length > MENU_MAX_BYTES)
+        return jsonResponse({ error: "response too large; narrow location, meal, or days" }, 400);
+      return new Response(body, { headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
     }
 
     // --- Telegram webhook ---

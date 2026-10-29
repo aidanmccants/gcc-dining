@@ -5,33 +5,68 @@
  * testable without network access.
  */
 
-import { validMeal, validDate } from "./menu-json.js";
-
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INFO = { name: "gcc-dining", title: "Grove City College Dining", version: "1.0.0" };
-const MEALS = ["breakfast", "lunch", "dinner"];
-const HALLS = ["map", "hicks"];
+const SERVER_INFO = { name: "gcc-dining", title: "Grove City College Dining", version: "1.1.0" };
+const MAX_TOOL_BYTES = 300 * 1024; // keep results small enough for an agent's context
 
 const INSTRUCTIONS =
-  "Menus for the Grove City College dining halls: MAP Cafe (map) and Hicks Cafe (hicks). " +
-  "Dates are YYYY-MM-DD and default to today in US Eastern time. Items may carry Nutrislice " +
-  "dietary/allergen icons; a missing icons field means unknown, an empty list means none listed.";
+  "Menus, hours, and open/closed status for Grove City College dining locations, from Nutrislice. " +
+  "The main halls are MAP Cafe (map-cafe, alias map) and Hicks Cafe (hicks-cafe, alias hicks); " +
+  "call get_locations for every location, its hours, and which meals it serves. " +
+  "Dates are YYYY-MM-DD and default to today in US Eastern time. Items may carry dietary/allergen " +
+  "icons; a missing icons field means unknown, an empty list means none listed.";
 
 const TOOLS = [
   {
     name: "get_menu",
-    title: "Get dining hall menu",
+    title: "Get dining menus",
     description:
-      "Get the Grove City College dining menu for a date, grouped by hall and station. " +
-      "Omit meal to get breakfast, lunch, and dinner; omit hall to get both MAP Cafe and Hicks Cafe. " +
-      'A hall with state "none" has no menu posted for that meal.',
+      "Menus by day, location, meal, and station. Defaults: today, MAP Cafe and Hicks Cafe, every meal they serve. " +
+      'Each meal has state "menu" (stations listed), "closed" (a posted closure notice, in notice), or ' +
+      '"none" (nothing posted, which may mean closed or not published yet). ' +
+      "Set details=true for nutrition, ingredients, serving size, and category per item.",
     inputSchema: {
       type: "object",
       properties: {
-        date: { type: "string", description: "YYYY-MM-DD. Defaults to today (America/New_York)." },
-        meal: { type: "string", enum: MEALS, description: "Defaults to all three meals." },
-        hall: { type: "string", enum: [...HALLS, "both"], description: "Defaults to both." },
+        date: { type: "string", description: "First day, YYYY-MM-DD. Defaults to today (America/New_York)." },
+        days: { type: "integer", minimum: 1, maximum: 7, description: "Number of consecutive days. Default 1." },
+        location: {
+          type: "string",
+          description:
+            'Location slug, comma-separated slugs, or "all". Aliases: map, hicks. Default: map-cafe,hicks-cafe.',
+        },
+        meal: {
+          type: "string",
+          description: "Menu type slug, e.g. breakfast, lunch, dinner, late-night-bite. Default: all.",
+        },
+        details: { type: "boolean", description: "Include nutrition, ingredients, serving size. Default false." },
       },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  {
+    name: "get_locations",
+    title: "Get dining locations and hours",
+    description:
+      "Every Grove City College dining location: slug, name, current open/closed status, weekly hours, " +
+      "hours per meal, building, and season dates. Hours are local (US Eastern), HH:MM, null = closed that day. " +
+      "Status and hours follow the regular weekly schedule and do not reflect break closures; " +
+      'check get_menu for "closed" notices.',
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  {
+    name: "nutrislice_raw",
+    title: "Raw Nutrislice API request",
+    description:
+      "Escape hatch: GET any path under https://gcc.api.nutrislice.com/menu/api/ and return the raw JSON. " +
+      'Examples: "schools/", "weeks/school/map-cafe/menu-type/lunch/2026/10/28/". ' +
+      "Week responses are large (~700 KB) and usually exceed the size limit; prefer get_menu with details=true.",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string", description: "Path relative to /menu/api/, with trailing slash." } },
+      required: ["path"],
       additionalProperties: false,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
@@ -40,7 +75,7 @@ const TOOLS = [
 
 export const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, Mcp-Protocol-Version, Mcp-Session-Id",
 };
 
@@ -53,26 +88,36 @@ const rpcResult = (id, result) => json({ jsonrpc: "2.0", id, result });
 const rpcError = (id, code, message, status = 200) =>
   json({ jsonrpc: "2.0", id, error: { code, message } }, status);
 const toolError = (text) => ({ content: [{ type: "text", text }], isError: true });
+const UPSTREAM_DOWN = "Couldn't reach Nutrislice right now. Try again later.";
+const TOO_LARGE = "Result too large; narrow location, meal, or days, or turn off details.";
 
-// loadMeal(meal, ymd) -> { date, meal, halls: { map, hicks } }, throws on upstream failure.
-async function getMenu(args, { loadMeal, today }) {
-  const { date = today(), meal, hall = "both" } = args || {};
-  if (!validDate(date)) return toolError("Invalid date, use YYYY-MM-DD.");
-  if (meal !== undefined && !validMeal(meal)) return toolError("meal must be breakfast, lunch, or dinner.");
-  if (![...HALLS, "both"].includes(hall)) return toolError("hall must be map, hicks, or both.");
+function toolResult(data) {
+  const text = JSON.stringify(data);
+  if (new TextEncoder().encode(text).length > MAX_TOOL_BYTES) return toolError(TOO_LARGE);
+  return { content: [{ type: "text", text }], structuredContent: data };
+}
 
-  const meals = meal ? [meal] : MEALS;
-  let results;
-  try {
-    results = await Promise.all(meals.map((m) => loadMeal(m, date)));
-  } catch {
-    return toolError("Couldn't load the menu from Nutrislice right now. Try again later.");
+// deps: menuData(args) -> { data } | { error, status }; locationsData() throws on failure;
+// rawFetch(path) -> { status, body }.
+async function callTool(name, args, deps) {
+  if (name === "get_menu") {
+    const { data, error, status } = await deps.menuData(args || {});
+    if (error) return toolError(status === 502 ? UPSTREAM_DOWN : error);
+    return toolResult(data);
   }
-  const out = { date, meals: {} };
-  for (const r of results) {
-    out.meals[r.meal] = hall === "both" ? r.halls : { [hall]: r.halls[hall] };
+  if (name === "get_locations") {
+    try {
+      return toolResult(await deps.locationsData());
+    } catch {
+      return toolError(UPSTREAM_DOWN);
+    }
   }
-  return { content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out };
+  // nutrislice_raw
+  const { status, body } = await deps.rawFetch((args || {}).path);
+  if (status !== 200) return toolError(`Nutrislice returned HTTP ${status}: ${body.slice(0, 300)}`);
+  if (new TextEncoder().encode(body).length > MAX_TOOL_BYTES)
+    return toolError("Raw response too large for this tool; use get_menu or the /raw/ HTTP endpoint instead.");
+  return { content: [{ type: "text", text: body }] };
 }
 
 export async function handleMcp(req, deps) {
@@ -115,8 +160,8 @@ export async function handleMcp(req, deps) {
     case "tools/list":
       return rpcResult(id, { tools: TOOLS });
     case "tools/call":
-      if (params.name !== "get_menu") return rpcError(id, -32602, `Unknown tool: ${params.name}`);
-      return rpcResult(id, await getMenu(params.arguments, deps));
+      if (!TOOLS.some((t) => t.name === params.name)) return rpcError(id, -32602, `Unknown tool: ${params.name}`);
+      return rpcResult(id, await callTool(params.name, params.arguments, deps));
     default:
       return rpcError(id, -32601, `Method not found: ${method}`);
   }
