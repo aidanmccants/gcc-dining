@@ -2,3 +2,4 @@ node_modules
 .wrangler
 .dev.vars
 
+youtube_uploader_mcp.log
