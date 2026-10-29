@@ -19,6 +19,7 @@ export function stationEntries(items) {
   const groups = [];
   let current = null;
   for (const it of items) {
+    if (it.is_holiday) continue; // closure notices, see holidayNotice()
     if (it.is_section_title || it.is_station_header) {
       const name = (it.text || "").trim();
       if (name) {
@@ -33,6 +34,13 @@ export function stationEntries(items) {
   return groups.filter((g) => g.entries.length);
 }
 
+// Nutrislice marks closures with is_holiday rows, e.g. "Closed for Fall Break". Not every hall posts them.
+export function holidayNotice(items) {
+  if (!Array.isArray(items)) return undefined;
+  const texts = [...new Set(items.filter((it) => it.is_holiday).map((it) => (it.text || "").trim()).filter(Boolean))];
+  return texts.length ? texts.join(" / ") : undefined;
+}
+
 // absent = unknown, [] = source says none, [{name, slug}] = raw icons.
 export function iconsField(item) {
   const list = item && item.food && item.food.icons && item.food.icons.food_icons;
@@ -45,12 +53,15 @@ export function iconsField(item) {
   return out;
 }
 
+// state stays "menu" | "none" for existing clients (Plate); a closure only adds `notice`.
 export function hallJson(items) {
   if (items === null || items === undefined) return { state: "none", stations: [] };
+  const notice = holidayNotice(items);
   const groups = stationEntries(items);
-  if (!groups.length) return { state: "none", stations: [] };
+  if (!groups.length) return notice ? { state: "none", notice, stations: [] } : { state: "none", stations: [] };
   return {
     state: "menu",
+    ...(notice ? { notice } : {}),
     stations: groups.map((g) => ({
       name: g.station,
       items: g.entries.map(({ name, item }) => {
