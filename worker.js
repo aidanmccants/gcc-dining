@@ -14,6 +14,9 @@
  * JSON endpoint (read by the Plate app, includes allergen icons):
  *   GET /lunch/compare.json?date=2026-10-01
  *
+ * MCP server for AI agents (Streamable HTTP, no auth, tool: get_menu):
+ *   https://gccdining-mcp.mccants.link   (also POST /mcp on any host)
+ *
  * Setup:
  *   1. Talk to @BotFather, create a bot, copy the token.
  *   2. Worker dashboard -> Settings -> Variables -> add secret BOT_TOKEN.
@@ -27,6 +30,7 @@
  */
 
 import { stationEntries, buildCompareJson, validMeal, validDate, MAX_BYTES } from "./menu-json.js";
+import { handleMcp } from "./mcp.js";
 
 const API = "https://gcc.api.nutrislice.com/menu/api";
 const LOCATIONS = { map: "map-cafe", hicks: "hicks-cafe" };
@@ -36,6 +40,7 @@ const TARGETS = ["map", "hicks", "compare"];
 const API_CHANGED_MSG =
   "Couldn't load the menu — Nutrislice's API may have changed. The worker needs an update.";
 const JSON_CACHE_SECONDS = 600;
+const MCP_HOST = "gccdining-mcp.mccants.link";
 
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const esc = (s) =>
@@ -131,14 +136,19 @@ const jsonResponse = (body, status = 200, extra = {}) =>
     headers: { "Content-Type": "application/json", ...extra },
   });
 
+// Both halls for one meal as JSON (shared by compare.json and the MCP server). Throws on upstream failure.
+async function mealJson(meal, ymd) {
+  const [mapItems, hicksItems] = await Promise.all([
+    dayItems(LOCATIONS.map, meal, ymd, JSON_CACHE_SECONDS),
+    dayItems(LOCATIONS.hicks, meal, ymd, JSON_CACHE_SECONDS),
+  ]);
+  return buildCompareJson(meal, ymd, mapItems, hicksItems);
+}
+
 // GET /{meal}/compare.json: never returns a partial menu; any upstream problem is a 502.
 async function compareJson(meal, ymd) {
   try {
-    const [mapItems, hicksItems] = await Promise.all([
-      dayItems(LOCATIONS.map, meal, ymd, JSON_CACHE_SECONDS),
-      dayItems(LOCATIONS.hicks, meal, ymd, JSON_CACHE_SECONDS),
-    ]);
-    const body = JSON.stringify(buildCompareJson(meal, ymd, mapItems, hicksItems));
+    const body = JSON.stringify(await mealJson(meal, ymd));
     if (new TextEncoder().encode(body).length > MAX_BYTES) throw new Error("response too large");
     return new Response(body, { headers: { "Content-Type": "application/json" } });
   } catch {
@@ -186,6 +196,11 @@ export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
+
+    // --- MCP server: POST /mcp on any host, or / on the dedicated MCP domain ---
+    if (path === "/mcp" || (url.hostname === MCP_HOST && path === "/")) {
+      return handleMcp(req, { loadMeal: mealJson, today: todayET });
+    }
 
     // --- Telegram webhook ---
     if (req.method === "POST" && (path === "/tg" || path === "/webhook")) {
