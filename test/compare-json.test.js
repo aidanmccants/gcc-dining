@@ -58,6 +58,32 @@ describe("buildCompareJson", () => {
   });
 });
 
+describe("compare.json nutrition", () => {
+  const withInfo = (name, rni, size, cat) => ({
+    is_section_title: false,
+    food: { name, rounded_nutrition_info: rni, serving_size_info: size, food_category: cat },
+  });
+  const items = [
+    section("S"),
+    withInfo("Pizza", { calories: 353, g_fat: 13, g_carbs: 38, g_protein: 20, mg_sodium: 530 }, { serving_size_amount: "1", serving_size_unit: "slice" }, "entree"),
+    withInfo("Nulls", { calories: null, g_fat: null, g_carbs: null, g_protein: null }, { serving_size_amount: "1" }),
+    withInfo("No protein", { calories: 90, g_fat: 1, g_carbs: 20, g_protein: null }, null),
+  ];
+  const out = buildCompareJson("lunch", "2026-09-29", items, null).halls.map.stations[0].items;
+  it("forwards calories + three macros, serving, and category only", () => {
+    expect(out[0]).toEqual({
+      name: "Pizza",
+      nutrition: { calories: 353, g_fat: 13, g_carbs: 38, g_protein: 20 },
+      serving_size: { amount: "1", unit: "slice" },
+      category: "entree",
+    });
+  });
+  it("omits nutrition entirely without calories, and drops null macros", () => {
+    expect(out[1]).toEqual({ name: "Nulls" });
+    expect(out[2]).toEqual({ name: "No protein", nutrition: { calories: 90, g_fat: 1, g_carbs: 20 } });
+  });
+});
+
 describe("station walk matches the original text-endpoint logic", () => {
   it("same stations and names as the original stationGroups", () => {
     const items = [food("Orphan"), section("A"), food("a1"), food("  "), section(" "), food("a2"), section("B")];
