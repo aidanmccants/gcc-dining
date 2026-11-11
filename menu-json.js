@@ -53,6 +53,28 @@ export function iconsField(item) {
   return out;
 }
 
+// The four numbers Plate shows (per serving_size), from the same weekly fetch. Each key is present only when
+// Nutrislice gave a number, and the whole field is absent without calories, so missing data never reads as 0.
+const MACROS = ["calories", "g_fat", "g_carbs", "g_protein"];
+export function nutritionFields(item) {
+  const f = item && item.food;
+  if (!f) return {};
+  const info = f.rounded_nutrition_info || {};
+  const nutrition = {};
+  for (const k of MACROS) if (typeof info[k] === "number" && Number.isFinite(info[k])) nutrition[k] = info[k];
+  if (nutrition.calories === undefined) return {};
+  const out = { nutrition };
+  const s = f.serving_size_info || {};
+  if (s.serving_size_amount || s.serving_size_unit) {
+    out.serving_size = {
+      ...(s.serving_size_amount ? { amount: String(s.serving_size_amount) } : {}),
+      ...(s.serving_size_unit ? { unit: String(s.serving_size_unit) } : {}),
+    };
+  }
+  if (typeof f.food_category === "string" && f.food_category) out.category = f.food_category;
+  return out;
+}
+
 // state stays "menu" | "none" for existing clients (Plate); a closure only adds `notice`.
 export function hallJson(items) {
   if (items === null || items === undefined) return { state: "none", stations: [] };
@@ -66,7 +88,7 @@ export function hallJson(items) {
       name: g.station,
       items: g.entries.map(({ name, item }) => {
         const icons = iconsField(item);
-        return icons === undefined ? { name } : { name, icons };
+        return { ...(icons === undefined ? { name } : { name, icons }), ...nutritionFields(item) };
       }),
     })),
   };
